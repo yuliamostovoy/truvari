@@ -84,20 +84,25 @@ class Remap():
         partial_hits = 0
         close_dist = None
         for aln in self.aligner.align_seq(seq):
+            # Filter hits below threshold
+            end, soft = self.get_end(aln.pos, aln.cigar)
+            # distance can be to either the beginning or end of the alignment, whichever is closer
+            dist = min(abs(aln.pos - entry.pos), abs(end - entry.pos))
+
             # Take out the 'same spot' alignment for deletions
-            dist = abs(aln.pos - entry.pos)
             if is_del and aln.rname == entry.chrom and dist < self.min_distance:
                 continue
 
-            # Filter hits below threshold
-            end, soft = self.get_end(aln.pos, aln.cigar)
             seq_len = len(seq)
             pct_query = (seq_len - soft) / seq_len
             if pct_query < threshold:
                 partial_hits += 1
                 continue
             hit = f"{aln.rname}:{aln.pos}-{end}.{int(pct_query*100)}"
-            bisect.insort(all_hits, (pct_query, hit))
+            # Store distance for sorting when REMAPHits is enabled
+            chrom_dist = float('inf') if aln.rname != entry.chrom else dist
+            # Sort by distance first, then by percentage (descending)
+            bisect.insort(all_hits, (chrom_dist, -pct_query, hit))
             num_hits += 1
             if aln.rname != entry.chrom:
                 continue
@@ -106,7 +111,7 @@ class Remap():
 
         if num_hits == 0 and partial_hits == 0:
             return "novel", all_hits
-        if close_dist and close_dist <= len(seq):
+        if close_dist is not None and close_dist <= len(seq):
             return "tandem", all_hits
         if num_hits == 0 and partial_hits != 0:
             return "partial", all_hits
@@ -122,8 +127,8 @@ class Remap():
             remap, hits = self.remap_entry(entry)
             entry.info["REMAP"] = remap
             if self.anno_hits and hits:
-                entry.info["REMAPHits"] = [_[1]
-                                           for _ in hits[-self.anno_hits:]]
+                # Hits are already sorted by distance, then by quality (desc)
+                entry.info["REMAPHits"] = [hit[2] for hit in hits[:self.anno_hits]]
         return entry
 
     def annotate_vcf(self):
