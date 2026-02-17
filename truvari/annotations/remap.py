@@ -7,10 +7,12 @@ Classification:
     interspersed : Closest hit is not tandem
     partial      : Only partial hit(s) passing min score but < threshold coverage
     failed       : Alignment infrastructure failure (aligner error). Indicates retry needed.
+    over_max_size: Skipped because ALT sequence exceeded --max-length cutoff
 
 Parameters:
-    --minlength        Minimum SV length to be remapped (50)
-    --threshold        Minimum fraction of allele aligned (.8). For >100kb: use absolute threshold * 100kb
+    -m/--min-length    Minimum SV length to be remapped (50)
+    -M/--max-length    Maximum ALT sequence length (bp) to attempt remap (10000000)
+    --cov-threshold    Minimum fraction of allele aligned (.8). For >100kb: use absolute threshold * 100kb
     --aligner          bwa (default), minimap2, or blastn
     --mm2-preset       minimap2 preset (asm20 default; options: asm5, asm10, asm20, map-ont, sr, etc.)
     --threads          Number of threads
@@ -165,8 +167,9 @@ class Minimap2BatchAligner:
             logging.info(f"minimap2 cmd: {shlex.join(cmd)}")
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
-                logging.error(f"minimap2 exited {proc.returncode}: {proc.stderr.strip()}")
-                return results
+                err_msg = proc.stderr.strip()
+                logging.error(f"minimap2 exited {proc.returncode}: {err_msg}")
+                raise RuntimeError(f"minimap2 exited {proc.returncode}")
             if self.save_output_path:
                 try:
                     with open(self.save_output_path, 'w') as out_raw:
@@ -216,8 +219,9 @@ class BwaBatchAligner:
             logging.info(f"bwa cmd: {shlex.join(cmd)}")
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
-                logging.error(f"bwa exited {proc.returncode}: {proc.stderr.strip()}")
-                return results
+                err_msg = proc.stderr.strip()
+                logging.error(f"bwa exited {proc.returncode}: {err_msg}")
+                raise RuntimeError(f"bwa exited {proc.returncode}")
             # Save raw SAM output if requested
             if self.save_output_path:
                 try:
@@ -284,8 +288,9 @@ class BlastBatchAligner:
             logging.info(f"blastn cmd: {shlex.join(cmd)}")
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
-                logging.error(f"blastn exited {proc.returncode}: {proc.stderr.strip()}")
-                return results
+                err_msg = proc.stderr.strip()
+                logging.error(f"blastn exited {proc.returncode}: {err_msg}")
+                raise RuntimeError(f"blastn exited {proc.returncode}")
             if self.save_output_path:
                 try:
                     with open(self.save_output_path, 'w') as blast_out:
@@ -329,20 +334,22 @@ class Remap:
     """ Class for remapping annotation """
 
     def __init__(self, in_vcf, reference, out_vcf="/dev/stdout", min_length=50,
-                 threshold=0.8, aligner="bwa",
+                 cov_threshold=0.8, aligner="bwa",
                  mm2_preset="asm20", threads=4,
-                 mm2_threshold=5000, save_alignments_prefix=None, blast_db=None,
+                 mm2_threshold=5000, max_length=10_000_000,
+                 save_alignments_prefix=None, blast_db=None,
                  param_state=None):
         self.in_vcf = in_vcf
         self.reference = reference
         self.out_vcf = out_vcf
         self.min_length = min_length
-        self.threshold = threshold
+        self.cov_threshold = cov_threshold
         self.aligner_choice = aligner
         self.mm2_preset = mm2_preset
         self.threads = threads
         self.n_header = None
         self.mm2_threshold = int(mm2_threshold)
+        self.max_length = int(max_length)
         self.save_alignments_prefix = save_alignments_prefix
         self._small_out_path = None
         self._large_out_path = None
@@ -375,6 +382,7 @@ class Remap:
 
         self._batch_results = {}
         self._failed_queries = set()  # infrastructure failures only
+        self._over_max_queries = set()
 
     def edit_header(self, header=None):
         if header is None:
@@ -411,20 +419,18 @@ class Remap:
         if seq is None:
             return []
         seq = str(seq)
-        if len(seq) < 20:
-            logging.debug("Skip alignment: sequence <20bp")
-            return []
-        if seq.startswith("<") and seq.endswith(">"):
-            logging.debug("Skip alignment: symbolic ALT allele")
-            return []
         if qname is None:
             return []
         return self._batch_results.get(qname, [])
 
-    def remap_entry(self, entry, threshold=.8):
+    def remap_entry(self, entry, cov_threshold=None):
         # Only insertions are supported for remapping/annotation
         seq = entry.alts[0]
         qname = self.make_qname(entry, seq)
+        if cov_threshold is None:
+            cov_threshold = self.cov_threshold
+        if qname in self._over_max_queries:
+            return "over_max_size", []
         if qname in self._failed_queries:
             return "failed", []
 
@@ -445,7 +451,7 @@ class Remap:
             seq_len = len(seq)
             aligned_bases = seq_len - soft
             pct_query = aligned_bases / seq_len
-            passes_threshold = pct_query >= threshold
+            passes_threshold = pct_query >= cov_threshold
             hit_coords = f"{aln.rname}:{aln.pos}-{end}"
             chrom_dist = float('inf') if aln.rname != entry.chrom else dist
             hit_meta = {
@@ -527,6 +533,7 @@ class Remap:
         small_queries = []
         mm2_queries = []
         entries = []
+        logging.info(f"Parsing VCF {self.in_vcf} for insertion sequences to remap")
         for entry in fh:
             entries.append(entry)
             # Only build alignment queries for insertions
@@ -537,33 +544,45 @@ class Remap:
             seq = entry.alts[0]
             if seq.startswith("<") and seq.endswith(">"):
                 continue
-            if len(seq) < 20:
+            seq_len = len(seq)
+            if seq_len < self.min_length:
                 continue
             qname = self.make_qname(entry, seq)
+            if seq_len > self.max_length:
+                logging.warning(
+                    "Skipping %s:%d insertion (%d bp) exceeding max_length=%d",
+                    entry.chrom, entry.pos, seq_len, self.max_length)
+                self._over_max_queries.add(qname)
+                continue
             queries.append((qname, seq))
             # Insertions larger than threshold go to minimap2, others to user's choice
-            if len(seq) > self.mm2_threshold:
+            if seq_len > self.mm2_threshold:
                 mm2_queries.append((qname, seq))
             else:
                 small_queries.append((qname, seq))
-        logging.info(f"Total sequences: {len(queries)} | small/other: {len(small_queries)} | large INS (mm2): {len(mm2_queries)}")
-        try:
-            # Run small aligner batch
-            self._batch_results = {}
-            if small_queries:
-                logging.info(f"Running {self.aligner_choice} on {len(small_queries)} sequences")
+        logging.info(f"Total sequences: {len(queries)} | small INS: {len(small_queries)} | large INS (mm2): {len(mm2_queries)}")
+        self._batch_results = {}
+        if small_queries:
+            logging.info(f"Running {self.aligner_choice} on {len(small_queries)} sequences")
+            try:
                 small_res = self.small_aligner.align_batch(small_queries)
+            except Exception as e:
+                logging.error(f"{self.aligner_choice} aligner failure: {e}")
+                for qname, _ in small_queries:
+                    self._failed_queries.add(qname)
+            else:
                 self._batch_results.update(small_res)
-            # Run minimap2 for large insertions
-            if mm2_queries:
-                logging.info(f"Running minimap2 on {len(mm2_queries)} large insertions (>{self.mm2_threshold} bp)")
+        if mm2_queries:
+            logging.info(f"Running minimap2 on {len(mm2_queries)} large insertions (>{self.mm2_threshold} bp)")
+            try:
                 mm2_res = self.mm2_aligner.align_batch(mm2_queries)
+            except Exception as e:
+                logging.error(f"minimap2 aligner failure: {e}")
+                for qname, _ in mm2_queries:
+                    self._failed_queries.add(qname)
+            else:
                 # Merge, mm2 results take precedence for those qnames
                 self._batch_results.update(mm2_res)
-        except Exception as e:
-            logging.error(f"Aligner failure: {e}")
-            for qname, _ in queries:
-                self._failed_queries.add(qname)
         for entry in entries:
             entry = self.annotate_entry(entry)
             out.write(entry)
@@ -578,28 +597,27 @@ def parse_args(args):
                         help="Reference FASTA file")
     parser.add_argument("-o", "--output", default="/dev/stdout",
                         help="Output VCF (%(default)s)")
-    parser.add_argument("-m", "--minlength", default=50, type=truvari.restricted_int,
+    parser.add_argument("-m", "--min-length", default=50, type=truvari.restricted_int,
                         help="Smallest length of allele to remap (%(default)s)")
-    parser.add_argument("-t", "--threshold", type=truvari.restricted_float, default=.8,
+    parser.add_argument("-M", "--max-length", type=truvari.restricted_int, default=10_000_000,
+                        help="Largest ALT sequence length (bp) to attempt remap (%(default)s)")
+    parser.add_argument("--mm2-threshold", type=truvari.restricted_int, default=5000,
+                        help="Insertions larger than this (bp) are aligned with minimap2 (%(default)s)")
+    parser.add_argument("--cov-threshold", type=truvari.restricted_float, default=.8,
                         help="Threshold for pct of allele covered to consider hit (%(default)s)")
     parser.add_argument("--aligner", choices=["minimap2", "bwa", "blastn"], default="bwa",
                         help="Aligner choice (%(default)s)")
     parser.add_argument("--mm2-preset", default="asm20",
                         help="minimap2 preset (asm20 default; asm5/asm10/map-ont/sr etc.) (%(default)s)")
-    parser.add_argument("--threads", type=truvari.restricted_int, default=4,
+    parser.add_argument("--threads", type=truvari.restricted_int, default=1,
                         help="Threads for the aligner (%(default)s)")
     parser.add_argument("--blast-db", default=None,
                         help="Pre-built BLAST database prefix (required when --aligner blastn)")
     parser.add_argument("--save-alignments-prefix", default=None,
                         help="Path prefix; files named <prefix>small.sam and <prefix>large.sam will be written")
-    parser.add_argument("--mm2-threshold", type=truvari.restricted_int, default=5000,
-                        help="Insertions larger than this (bp) are aligned with minimap2 (%(default)s)")
-    parser.add_argument("--debug", action="store_true",
-                        help="Verbose logging")
     a = parser.parse_args(args)
-    truvari.setup_logging(a.debug, show_version=True)
+    truvari.setup_logging(True, show_version=True)
     return a
-
 
 def remap_main(cmdargs):
     args = parse_args(cmdargs)
@@ -610,17 +628,18 @@ def remap_main(cmdargs):
         param_state = str(vars(args))
     try:
         anno = Remap(in_vcf=args.input,
-                 reference=args.reference,
-                 out_vcf=args.output,
-                 min_length=args.minlength,
-                 threshold=args.threshold,
-                 aligner=args.aligner,
-                 mm2_preset=args.mm2_preset,
-                 threads=args.threads,
-                 mm2_threshold=args.mm2_threshold,
-                 save_alignments_prefix=args.save_alignments_prefix,
-                 blast_db=args.blast_db,
-                 param_state=param_state)
+             reference=args.reference,
+             out_vcf=args.output,
+             min_length=args.min_length,
+             cov_threshold=args.cov_threshold,
+             aligner=args.aligner,
+             mm2_preset=args.mm2_preset,
+             threads=args.threads,
+             mm2_threshold=args.mm2_threshold,
+             max_length=args.max_length,
+             save_alignments_prefix=args.save_alignments_prefix,
+             blast_db=args.blast_db,
+             param_state=param_state)
         anno.annotate_vcf()
         logging.info("Finished remap")
     except Exception as e:
