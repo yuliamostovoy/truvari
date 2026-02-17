@@ -43,12 +43,17 @@ def log_subprocess_failure(tool_name, proc):
     """Log exit details and stderr content from a failed subprocess."""
     rc = proc.returncode
     if rc < 0:
-        logging.error(f"{tool_name} terminated by signal {abs(rc)}")
+        logging.error(f"{tool_name} Killed (signal {abs(rc)})")
+    elif rc == 137:
+        logging.error(f"{tool_name} Killed (exit {rc})")
     else:
         logging.error(f"{tool_name} exited with code {rc}")
     stderr = (proc.stderr or "").strip()
     if stderr:
         logging.error(f"{tool_name} stderr:\n{stderr}")
+        lower = stderr.lower()
+        if "out of memory" in lower or "oom" in lower:
+            logging.error(f"{tool_name} OutOfMemory detected")
 
 def infer_query_size(qname, seq=None, fallback=0):
     """Infer query length from qname (q<chrom>_<pos>_<len>_<hash>) or fall back to sequence."""
