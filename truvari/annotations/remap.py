@@ -578,6 +578,7 @@ class Remap:
                 logging.error(f"{self.aligner_choice} aligner failure: {e}")
                 for qname, _ in small_queries:
                     self._failed_queries.add(qname)
+                raise RuntimeError(f"{self.aligner_choice} aligner failure") from e
             else:
                 self._batch_results.update(small_res)
         if mm2_queries:
@@ -588,6 +589,7 @@ class Remap:
                 logging.error(f"minimap2 aligner failure: {e}")
                 for qname, _ in mm2_queries:
                     self._failed_queries.add(qname)
+                raise RuntimeError("minimap2 aligner failure") from e
             else:
                 # Merge, mm2 results take precedence for those qnames
                 self._batch_results.update(mm2_res)
