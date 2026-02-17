@@ -39,6 +39,17 @@ import truvari
 from truvari.annotations.grm import cigmatch
 
 
+def log_subprocess_failure(tool_name, proc):
+    """Log exit details and stderr content from a failed subprocess."""
+    rc = proc.returncode
+    if rc < 0:
+        logging.error(f"{tool_name} terminated by signal {abs(rc)}")
+    else:
+        logging.error(f"{tool_name} exited with code {rc}")
+    stderr = (proc.stderr or "").strip()
+    if stderr:
+        logging.error(f"{tool_name} stderr:\n{stderr}")
+
 def infer_query_size(qname, seq=None, fallback=0):
     """Infer query length from qname (q<chrom>_<pos>_<len>_<hash>) or fall back to sequence."""
     if qname:
@@ -167,8 +178,7 @@ class Minimap2BatchAligner:
             logging.info(f"minimap2 cmd: {shlex.join(cmd)}")
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
-                err_msg = proc.stderr.strip()
-                logging.error(f"minimap2 exited {proc.returncode}: {err_msg}")
+                log_subprocess_failure("minimap2", proc)
                 raise RuntimeError(f"minimap2 exited {proc.returncode}")
             if self.save_output_path:
                 try:
@@ -219,8 +229,7 @@ class BwaBatchAligner:
             logging.info(f"bwa cmd: {shlex.join(cmd)}")
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
-                err_msg = proc.stderr.strip()
-                logging.error(f"bwa exited {proc.returncode}: {err_msg}")
+                log_subprocess_failure("bwa", proc)
                 raise RuntimeError(f"bwa exited {proc.returncode}")
             # Save raw SAM output if requested
             if self.save_output_path:
@@ -288,8 +297,7 @@ class BlastBatchAligner:
             logging.info(f"blastn cmd: {shlex.join(cmd)}")
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
-                err_msg = proc.stderr.strip()
-                logging.error(f"blastn exited {proc.returncode}: {err_msg}")
+                log_subprocess_failure("blastn", proc)
                 raise RuntimeError(f"blastn exited {proc.returncode}")
             if self.save_output_path:
                 try:
