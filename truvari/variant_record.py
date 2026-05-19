@@ -234,8 +234,8 @@ class VariantRecord:
         end = self.end
         if ins_inflate and self.var_type() == truvari.SV.INS:
             size = self.var_size()
-            start -= size // 2
-            end += size // 2
+            start -= size
+            end += size
         return start, end
 
     def compare_gts(self, other, match):
