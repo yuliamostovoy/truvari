@@ -42,14 +42,18 @@ from truvari.annotations.grm import cigmatch
 
 def log_subprocess_failure(tool_name, proc):
     """Log exit details and stderr content from a failed subprocess."""
-    rc = proc.returncode
+    log_subprocess_failure_rc(tool_name, proc.returncode, proc.stderr)
+
+
+def log_subprocess_failure_rc(tool_name, rc, stderr):
+    """Log exit details and stderr content given a return code and stderr text."""
     if rc < 0:
         logging.error(f"{tool_name} Killed (signal {abs(rc)})")
     elif rc == 137:
         logging.error(f"{tool_name} Killed (exit {rc})")
     else:
         logging.error(f"{tool_name} exited with code {rc}")
-    stderr = (proc.stderr or "").strip()
+    stderr = (stderr or "").strip()
     if stderr:
         logging.error(f"{tool_name} stderr:\n{stderr}")
         lower = stderr.lower()
@@ -88,13 +92,16 @@ def parse_cigar_metrics(cigar):
             match_bases += val
         if ch in ('M', 'D', 'N', '=', 'X'):
             ref_advance += val
-        if ch in ('M', 'I', 'S', '=', 'X'):
+        # Count hard clips (H) alongside soft clips (S) so query coordinates are
+        # identical whether supplementary alignments are soft- or hard-clipped
+        # (i.e. whether minimap2 is run with -Y or not).
+        if ch in ('M', 'I', 'S', 'H', '=', 'X'):
             query_advance += val
         num = ''
     if ops:
-        if ops[0][1] == 'S':
+        if ops[0][1] in ('S', 'H'):
             left_soft = ops[0][0]
-        if ops[-1][1] == 'S':
+        if ops[-1][1] in ('S', 'H'):
             right_soft = ops[-1][0]
     return {
         "match_bases": match_bases,
@@ -214,28 +221,55 @@ class Minimap2BatchAligner:
         with os.fdopen(fd_q, 'w') as out:
             for name, seq in queries:
                 out.write(f">{name}\n{seq}\n")
+        fd_err, err_path = tempfile.mkstemp(prefix="remap_mm2_", suffix=".stderr")
+        os.close(fd_err)
+        save_fh = None
         try:
-            cmd = [self.binary, "-x", self.preset, "-a", "-Y", "--max-chain-skip", "50000", "-N", "500","-k","15","-w","5","-t", str(self.threads), self.reference, q_fa]
+            # Hard-clip supplementary alignments (no -Y): keeps large-insertion SAM
+            # records from carrying a full copy of the query sequence, which is the
+            # main driver of minimap2 memory blowups on long variants. The SAM parser
+            # treats H and S identically, so alignment coordinates are unchanged.
+            cmd = [self.binary, "-x", self.preset, "-a", "--max-chain-skip", "50000", "-N", "500","-k","15","-w","5","-t", str(self.threads), self.reference, q_fa]
             logging.info(f"minimap2 path: {self.binary}")
             logging.info(f"minimap2 cmd: {shlex.join(cmd)}")
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                log_subprocess_failure("minimap2", proc)
-                raise RuntimeError(f"minimap2 exited {proc.returncode}")
             if self.save_output_path:
                 try:
-                    with open(self.save_output_path, 'w') as out_raw:
-                        out_raw.write(proc.stdout)
-                    logging.info(f"Saved minimap2 output to {self.save_output_path}")
+                    save_fh = open(self.save_output_path, 'w')
                 except Exception as e:
-                    logging.warning(f"Failed to save minimap2 output to {self.save_output_path}: {e}")
-            # Parse SAM from stdout using shared parser
-            parse_sam_lines(proc.stdout.splitlines(), results, source="minimap2")
+                    logging.warning(f"Failed to open {self.save_output_path} for writing: {e}")
+                    save_fh = None
+            # Stream SAM line-by-line rather than buffering the entire output; the full
+            # SAM for a batch of large insertions can be many GB.
+            with open(err_path, 'w') as err_fh:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_fh, text=True)
+
+                def _lines():
+                    for line in proc.stdout:
+                        if save_fh is not None:
+                            save_fh.write(line)
+                        yield line
+
+                parse_sam_lines(_lines(), results, source="minimap2")
+                proc.stdout.close()
+                returncode = proc.wait()
+            if returncode != 0:
+                with open(err_path, 'r') as err_in:
+                    stderr_text = err_in.read()
+                log_subprocess_failure_rc("minimap2", returncode, stderr_text)
+                raise RuntimeError(f"minimap2 exited {returncode}")
+            if self.save_output_path and save_fh is not None:
+                logging.info(f"Saved minimap2 output to {self.save_output_path}")
         finally:
-            try:
-                os.unlink(q_fa)
-            except OSError:
-                pass
+            if save_fh is not None:
+                try:
+                    save_fh.close()
+                except OSError:
+                    pass
+            for path in (q_fa, err_path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
         return results
 
     # Removed per-aligner SAM parser; using shared parse_sam_lines
