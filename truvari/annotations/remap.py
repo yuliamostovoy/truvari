@@ -835,6 +835,45 @@ class Remap:
             "local_rescue": True,
         }
 
+    def _is_misplaced_tandem_dup_complex(self, entry, chain, seq_len, debug_lines=None):
+        """Detect a stitched local pattern caused by a shifted insertion position inside a simple tandem duplication.
+
+        Expected geometry:
+        - exactly two same-orientation segments
+        - both on the source chromosome
+        - query starts with the segment that maps at the reported INS position
+        - the second segment maps earlier on the reference and runs back to the INS position
+        """
+        if len(chain) != 2 or seq_len <= 0:
+            return False
+
+        left, right = sorted(chain, key=lambda s: (s["query_start"], s["query_end"]))
+        ref_slop = max(25, min(250, int(seq_len * 0.1)))
+        query_slop = max(10, min(100, int(seq_len * 0.05)))
+        source_span = max(left["end"], right["end"]) - min(left["start"], right["start"]) + 1
+
+        checks = {
+            "same_chrom": left["rname"] == entry.chrom and right["rname"] == entry.chrom,
+            "same_orientation": left["orientation"] == '+' and right["orientation"] == '+',
+            "starts_query": left["query_start"] <= query_slop,
+            "ends_query": right["query_end"] >= seq_len - query_slop,
+            "ref_wraps_back": right["start"] < left["start"],
+            "first_starts_at_ins": abs(left["start"] - entry.pos) <= ref_slop,
+            "second_ends_at_ins": abs(right["end"] - entry.pos) <= ref_slop,
+            "segments_meet": abs(right["end"] - left["start"]) <= ref_slop,
+            "source_span_matches_query": 0.7 <= (source_span / seq_len) <= 1.3,
+        }
+
+        self._debug_log(
+            debug_lines,
+            "misplaced tandem-dup refinement checks: "
+            + ", ".join(f"{key}={value}" for key, value in checks.items())
+            + f" | left={self._segment_to_string(left)} right={self._segment_to_string(right)}"
+            + f" | entry_pos={entry.pos} seq_len={seq_len} source_span={source_span}"
+            + f" ref_slop={ref_slop} query_slop={query_slop}"
+        )
+        return all(checks.values())
+
     def _local_complex_hit(self, entry, local_segments, seq_len, cov_threshold, debug_lines=None):
         min_segment_bases = max(20, min(100, int(seq_len * 0.1)))
         candidates = [seg for seg in local_segments if seg["aligned_bases"] >= min_segment_bases]
@@ -852,7 +891,10 @@ class Remap:
         if pct_query < max(0.5, cov_threshold * 0.75):
             return None
         self._debug_log(debug_lines, "final complex chain: " + "|".join(self._segment_to_string(seg) for seg in chain))
-        return self._summarize_segment_chain(entry, chain, seq_len)
+        summary = self._summarize_segment_chain(entry, chain, seq_len)
+        if summary is not None and self._is_misplaced_tandem_dup_complex(entry, chain, seq_len, debug_lines=debug_lines):
+            summary["refined_classification"] = "tandem"
+        return summary
 
     def _align_simple(self, seq, chrom=None, pos=None, qname=None):
         """Return list of AlignmentHit for given query name after batch alignment."""
@@ -994,12 +1036,13 @@ class Remap:
         complex_hit = self._local_complex_hit(entry, local_segments, seq_len, cov_threshold, debug_lines=debug_lines)
         if complex_hit is not None:
             self._debug_log(debug_lines, f"complex_hit={complex_hit.get('segments', complex_hit.get('coords'))}")
+            complex_classification = complex_hit.get("refined_classification", "tandem_complex")
             if best_hit is None:
                 self._write_local_complex_debug(qname, debug_lines)
-                return {"classification": "tandem_complex", "best_hit": complex_hit}
+                return {"classification": complex_classification, "best_hit": complex_hit}
             if complex_hit["perc"] > best_hit["perc"] or (complex_hit["perc"] == best_hit["perc"] and complex_hit["score"] > best_hit["score"]):
                 self._write_local_complex_debug(qname, debug_lines)
-                return {"classification": "tandem_complex", "best_hit": complex_hit}
+                return {"classification": complex_classification, "best_hit": complex_hit}
         else:
             self._debug_log(debug_lines, "complex_hit=None")
 
